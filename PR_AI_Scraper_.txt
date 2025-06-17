@@ -1,0 +1,408 @@
+# 🧩 Step 1: Install Required Packages
+# Install packages at the beginning of the cell
+get_ipython().system('pip install google-search-results google-generativeai beautifulsoup4 requests pandas ipywidgets --quiet')
+
+
+import subprocess
+import os
+
+def install_and_import_serpapi():
+    import sys # Import sys inside the function
+    packages_to_try = ['google-search-results', 'serpapi']
+    for package in packages_to_try:
+        try:
+            print(f"📦 Attempting to install {package}...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", package, "--quiet"])
+            print(f"✅ Successfully installed {package}")
+
+            # Force reload of modules after installation
+            import importlib
+            import sys
+
+            # Clear any cached imports
+            if 'google_search_results' in sys.modules:
+                del sys.modules['google_search_results']
+            if 'serpapi' in sys.modules:
+                del sys.modules['serpapi']
+
+            # Try importing the newly installed package
+            if package == 'google-search-results':
+                try:
+                    from google_search_results import GoogleSearch
+                    return GoogleSearch, "google_search_results"
+                except ImportError:
+                    continue
+            elif package == 'serpapi':
+                try:
+                    from serpapi import Client
+                    return Client, "serpapi.Client"
+                except ImportError:
+                    try:
+                        from serpapi import GoogleSearch
+                        return GoogleSearch, "serpapi"
+                    except ImportError:
+                        continue
+
+        except subprocess.CalledProcessError:
+            print(f"❌ Failed to install {package}")
+    return None, None
+
+SERPAPI_AVAILABLE = False
+GoogleSearch = None
+SERPAPI_PACKAGE = None
+
+try:
+    from google_search_results import GoogleSearch
+    SERPAPI_AVAILABLE = True
+    SERPAPI_PACKAGE = "google_search_results"
+    print("✅ Using google-search-results package")
+except ImportError:
+    try:
+        from serpapi import Client
+        GoogleSearch = Client
+        SERPAPI_AVAILABLE = True
+        SERPAPI_PACKAGE = "serpapi.Client"
+        print("✅ Using modern serpapi package (Client)")
+    except ImportError:
+        try:
+            from serpapi import GoogleSearch
+            SERPAPI_AVAILABLE = True
+            SERPAPI_PACKAGE = "serpapi"
+            print("✅ Using legacy serpapi package")
+        except ImportError:
+            print("\n⚠️  SerpAPI package not found. Attempting automatic installation...")
+            GoogleSearch, SERPAPI_PACKAGE = install_and_import_serpapi()
+            if GoogleSearch and SERPAPI_PACKAGE:
+                SERPAPI_AVAILABLE = True
+                print(f"✅ Successfully installed and imported {SERPAPI_PACKAGE}")
+            else:
+                print("❌ Failed to install and import SerpAPI packages")
+
+if not SERPAPI_AVAILABLE:
+    print("\n" + "="*60)
+    print("❌ SERPAPI REQUIRED")
+    print("="*60)
+    print("Please manually install SerpAPI by running:")
+    print("  !pip install google-search-results")
+    print("Then restart your kernel and run this cell again.")
+    print("Get your API key from: https://serpapi.com/")
+    print("="*60)
+    print("\n💡 Alternative: You can also try:")
+    print("  !pip install --upgrade google-search-results")
+    print("  Then restart kernel and rerun this cell")
+    raise ImportError("SerpAPI package installation failed")
+
+# 🧠 Step 2: Other Imports
+try:
+    import google.generativeai as genai
+except ModuleNotFoundError:
+    raise ImportError("\n❌ The 'google-generativeai' package is not installed. Please run:\npip install google-generativeai")
+
+import requests
+import pandas as pd
+import json
+import time
+from bs4 import BeautifulSoup
+from datetime import datetime
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+
+# 🔐 Step 3: API Key Configuration
+def get_api_keys():
+    gemini_key = os.getenv('GEMINI_API_KEY')
+    serpapi_key = os.getenv('SERPAPI_API_KEY')
+    if not gemini_key:
+        gemini_key = input("🔑 Enter your Gemini API key: ").strip()
+    if not serpapi_key:
+        serpapi_key = input("🔑 Enter your SerpAPI key: ").strip()
+    return gemini_key, serpapi_key
+
+try:
+    gemini_api_key, serpapi_api_key = get_api_keys()
+    genai.configure(api_key=gemini_api_key)
+    print("✅ API keys loaded successfully")
+except Exception as e:
+    print(f"❌ Failed to load API keys: {e}")
+    sys.exit(1)
+
+# 🧮 Step 4: Create Input Widgets
+date_filter_dropdown = widgets.Dropdown(
+    options=[('Past 1 Day', 'd'), ('Past 7 Days', 'w'), ('Past 30 Days', 'm')],
+    value='m', description='Date Range:', style={'description_width': 'initial'}
+)
+num_results_slider = widgets.IntSlider(
+    value=20, min=10, max=50, step=5, description='Number of Results:', style={'description_width': 'initial'}
+)
+model_selector = widgets.Dropdown(
+    options=['gemini-1.5-flash-latest', 'gemini-1.5-pro-latest'], value='gemini-1.5-flash-latest', description='Gemini Model:', style={'description_width': 'initial'}
+)
+fallback_toggle = widgets.Checkbox(
+    value=True, description='Auto fallback to Flash if Pro fails', style={'description_width': 'initial'}
+)
+run_button = widgets.Button(description="🚀 Run Pipeline", button_style='success')
+stop_button = widgets.Button(description="🛑 Stop", button_style='danger')
+output_area = widgets.Output()
+
+display(date_filter_dropdown, num_results_slider, model_selector, fallback_toggle)
+display(widgets.HBox([run_button, stop_button]))
+display(output_area)
+
+# 🛑 Step 5: Stop Control
+class PipelineController:
+    def __init__(self):
+        self.should_stop_flag = False
+    def stop(self):
+        self.should_stop_flag = True
+        print("🛑 Pipeline stop requested...")
+    def should_stop(self):
+        return self.should_stop_flag
+    def reset(self):
+        self.should_stop_flag = False
+
+controller = PipelineController()
+def on_stop_button_click(b):
+    controller.stop()
+stop_button.on_click(on_stop_button_click)
+
+# 🧐 Step 6: Gemini Analyzer with Fallback (UPDATED)
+def analyze_with_gpt(text, model):
+    if controller.should_stop():
+        return {"error": "Pipeline stopped by user"}
+
+    USE_FALLBACK = fallback_toggle.value
+    prompt = f"""You are a clinical trial analyst. From the following press release, extract clinical trial information and structure it properly.
+
+Parse the clinical trial info and return a structured Python dictionary, not just raw JSON.
+
+Extract these specific fields:
+- trial_identifier: Clinical trial registry number (e.g., NCT number, EudraCT)
+- primary_drug: Main investigational drug being studied
+- secondary_drug: Additional therapy or supportive drugs (if mentioned)
+- comparator_drug: Comparator treatment (e.g., placebo, standard of care)
+- disease: Broad disease category (e.g., cancer, diabetes)
+- indication: Specific condition or subtype (e.g., HER2+ breast cancer)
+- trial_phase: Trial phase (e.g., Phase 2, Phase 3)
+- trial_design: Design of the trial (e.g., randomized, double-blind)
+- endpoint_achieved: Boolean (true/false) — Did the trial meet its primary endpoint?
+- result_summary: Key trial finding in one sentence, no more than 30 words
+- source_url: Use the URL provided to you (do not infer or fabricate)
+
+Return only a valid JSON object with these exact keys. No commentary, no bullet points, just the structured data.
+
+---PRESS RELEASE---
+{text[:8000]}"""
+
+    try:
+        # Initialize the Gemini model
+        gemini_model = genai.GenerativeModel(f'models/{model}')
+
+        # Generate content using Gemini
+        response = gemini_model.generate_content(prompt)
+
+        # Get the response text
+        content = response.text.strip()
+
+        # Clean up the response - remove markdown code blocks if present
+        if content.startswith('```json'):
+            content = content.replace('```json', '').replace('```', '').strip()
+        elif content.startswith('```'):
+            content = content.replace('```', '').strip()
+
+        # Try to parse as JSON and return structured dictionary
+        try:
+            parsed_data = json.loads(content)
+
+            # Ensure we have a proper dictionary structure with expected fields
+            structured_result = {
+                "trial_identifier": parsed_data.get("trial_identifier", ""),
+                "primary_drug": parsed_data.get("primary_drug", ""),
+                "secondary_drug": parsed_data.get("secondary_drug", ""),
+                "comparator_drug": parsed_data.get("comparator_drug", ""),
+                "disease": parsed_data.get("disease", ""),
+                "indication": parsed_data.get("indication", ""),
+                "trial_phase": parsed_data.get("trial_phase", ""),
+                "trial_design": parsed_data.get("trial_design", ""),
+                "endpoint_achieved": parsed_data.get("endpoint_achieved", None),
+                "result_summary": parsed_data.get("result_summary", ""),
+                "source_url": parsed_data.get("source_url", "")
+            }
+
+            # Convert endpoint_achieved to proper boolean if it's a string
+            if isinstance(structured_result["endpoint_achieved"], str):
+                endpoint_str = structured_result["endpoint_achieved"].lower()
+                if endpoint_str in ["true", "yes", "1", "achieved", "met"]:
+                    structured_result["endpoint_achieved"] = True
+                elif endpoint_str in ["false", "no", "0", "not achieved", "not met", "failed"]:
+                    structured_result["endpoint_achieved"] = False
+                else:
+                    structured_result["endpoint_achieved"] = None
+
+            return structured_result
+
+        except json.JSONDecodeError:
+            # If JSON parsing fails, try to extract information manually
+            return {
+                "error": "JSON parsing failed",
+                "gemini_raw_output": content,
+                "trial_identifier": "",
+                "primary_drug": "",
+                "secondary_drug": "",
+                "comparator_drug": "",
+                "disease": "",
+                "indication": "",
+                "trial_phase": "",
+                "trial_design": "",
+                "endpoint_achieved": None,
+                "result_summary": "",
+                "source_url": ""
+            }
+
+    except Exception as e:
+        if model == "gemini-1.5-pro-latest" and USE_FALLBACK:
+            print("⚠️ Gemini Pro failed. Retrying with Flash...")
+            return analyze_with_gpt(text, "gemini-1.5-flash-latest")
+        else:
+            return {
+                "error": f"Gemini error: {e}",
+                "trial_identifier": "",
+                "primary_drug": "",
+                "secondary_drug": "",
+                "comparator_drug": "",
+                "disease": "",
+                "indication": "",
+                "trial_phase": "",
+                "trial_design": "",
+                "endpoint_achieved": None,
+                "result_summary": "",
+                "source_url": ""
+            }
+
+# 🌐 Step 7: Web Scraper
+def fetch_clean_text(url):
+    if controller.should_stop():
+        return "ERROR: Pipeline stopped by user"
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; AppleWebKit/537.36)'
+        }
+        response = requests.get(url, timeout=10, headers=headers)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        return soup.get_text(separator="\n", strip=True)
+    except Exception as e:
+        return f"ERROR fetching content: {e}"
+
+# 🔍 Step 8: SerpAPI Search
+def search_press_releases(query, num_results, date_filter):
+    if controller.should_stop():
+        print("🛑 Search stopped by user")
+        return []
+    try:
+        print(f"🔍 Searching with SerpAPI: {query}")
+        if SERPAPI_PACKAGE == "serpapi.Client":
+            client = GoogleSearch(api_key=serpapi_api_key)
+            params = {
+                "engine": "google",
+                "q": query,
+                "num": min(num_results, 100),
+                "hl": "en",
+                "gl": "us",
+                "tbs": f"qdr:{date_filter}"
+            }
+            results = client.search(params)
+        else:
+            params = {
+                "engine": "google",
+                "q": query,
+                "num": min(num_results, 100),
+                "hl": "en",
+                "gl": "us",
+                "api_key": serpapi_api_key,
+                "tbs": f"qdr:{date_filter}"
+            }
+            search = GoogleSearch(params)
+            results = search.get_dict()
+
+        if "error" in results:
+            print(f"❌ SerpAPI error: {results['error']}")
+            return []
+
+        organic_results = results.get("organic_results", [])
+        print(f"✅ Found {len(organic_results)} search results")
+        return organic_results
+    except Exception as e:
+        print(f"❌ Search failed: {e}")
+        return []
+
+# 🧪 Step 9: Main Pipeline
+def run_pipeline(query, num_results, date_filter, model):
+    controller.reset()
+    links = search_press_releases(query, num_results, date_filter)
+    data = []
+    if controller.should_stop():
+        print("🛑 Pipeline stopped")
+        return pd.DataFrame()
+    for idx, result in enumerate(links):
+        if controller.should_stop():
+            print("🛑 Pipeline stopped")
+            break
+        title = result.get("title")
+        link = result.get("link")
+        source = result.get("source") or "Unknown"
+        print(f"\n📄 {idx+1}. {title}\n🔗 {link}")
+        content = fetch_clean_text(link)
+        if controller.should_stop():
+            print("🛑 Pipeline stopped")
+            break
+        if "ERROR" in content or len(content) < 500:
+            print("⚠️ Skipped due to error or short content.")
+            continue
+        summary = analyze_with_gpt(content[:4000], model)
+        if controller.should_stop():
+            print("🛑 Pipeline stopped")
+            break
+        row = {
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "source": source,
+            "title": title,
+            "url": link
+        }
+        if isinstance(summary, dict):
+            row.update(summary)
+        else:
+            row["gemini_raw_output"] = summary
+        data.append(row)
+        time.sleep(2)
+    df = pd.DataFrame(data)
+    if not df.empty:
+        df.to_csv("clinical_trial_summaries.csv", index=False)
+        print(f"\n💾 Saved {len(df)} results to clinical_trial_summaries.csv")
+    return df
+
+# 🚦 Step 10: Run Button Logic
+def on_run_button_click(b):
+    with output_area:
+        clear_output()
+        print("⏳ Running clinical trial pipeline...")
+        print(f"📊 Settings: {num_results_slider.value} results, {date_filter_dropdown.value} timeframe, {model_selector.value}")
+        print("-" * 60)
+        df = run_pipeline(
+            query='site:investors.*.com OR site:ir.*.com "clinical trial" press release',
+            num_results=num_results_slider.value,
+            date_filter=date_filter_dropdown.value,
+            model=model_selector.value
+        )
+        if not df.empty:
+            print("\n✅ Pipeline completed successfully!")
+            print(f"📈 Processed {len(df)} clinical trial press releases")
+            display(df.head())
+        else:
+            print("\n⚠️ No results found or pipeline was stopped")
+
+# 🔁 Step 11: Bind buttons
+run_button.on_click(on_run_button_click)
+
+print("🔧 Enhanced clinical trial pipeline loaded!")
+print(f"✅ Using SerpAPI via {SERPAPI_PACKAGE}")
+print("🚀 Ready to search and analyze clinical trial press releases!")
+print("\n💡 Click the '🚀 Run Pipeline' button above to start!")

@@ -1,0 +1,9 @@
+IPython
+bs4
+google
+google_search_results
+importlib
+ipywidgets
+pandas
+requests
+serpapi
